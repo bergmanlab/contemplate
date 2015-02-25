@@ -1,0 +1,706 @@
+#!/usr/bin/env python
+
+# first load the standard libraries from python
+# we require at least python 2.4
+from sys import *
+from optparse import OptionParser
+import logging, os, shutil, operator, sys, subprocess, glob
+
+# CONSTANTS 
+
+# name of program
+PROGNAME="pubtools"   
+# filename of output in testing mode
+TESTMETA="/tmp/meta" 
+# filename searched in environment variable FTHOME, triggers an error message if not found there
+# STARTUPCHECKFILE="ftToolsJava.jar" 
+# class name of tcp java server
+# JAVACLASS="FtToolsServer" 
+
+# startup step 1:
+# add PUBTOOLSHOME-dir to sys library path, otherwise python won't find our libraries
+pubToolsLibDir = os.environ.get("PUBTOOLSLIB","")
+if pubToolsLibDir=="":
+    # if var not set, take dir from path of executable
+    pubToolsLibDir = os.path.join(os.path.dirname(sys.argv[0]), "lib")
+sys.path.insert(0, pubToolsLibDir)
+sys.stderr.write("Added %s as first element in library search path (sys.path)\n" % pubToolsLibDir)
+
+# startup step2: check if path looks good
+#checkFname = os.path.join(pubToolsHomeDir, STARTUPCHECKFILE)
+#if not os.path.isfile(checkFname):
+    #logging.info("Could not find file %s, you might want to set the PUBTOOLSHOME variable" 
+        #% (checkFname))
+
+# startup step3: now load all libraries
+from articleParser import *
+import articleParser, util, html
+import maxConfig, maxTables, annotWrappers
+
+# === COMMAND LINE INTERFACE, OPTIONS AND HELP ===
+parser = OptionParser("""usage: %prog [options] command dataset options -
+    download fulltext and manage fulltext repository\n
+
+MAIN PIPELINE COMMANDS:
+
+getindex <dataset>: Download an index of fulltext files from dataset
+    (defined in pubtools.conf)
+
+download  <dataset>: Download/Import files from dataset using index file and
+    write metaInfo file, do not re-download/re-download articles that are 
+    already in the repository
+
+convert <datasets>: Convert as many files as possible to ASCII text (skipping
+    files that are already present)
+
+run <dataset> <algorithm>: Run the algorithm on all fulltext of a dataset,
+    writing results to <algorithm>.tab
+
+CLUSTER COMMANDS: 
+
+clusterDownload <dataset>: like download, but on cluster, will create
+    files <dataset>.metaInfo.<node>, use concat (see below) to concat 
+    them into <dataset>.metaInfo once jobs have finished
+clusterConvert <dataset>: like convert but on cluster. Will read from
+    <dataset>.metaInfo and write to <asciiDir>/<dataset>.metaInfo.<node>,
+    skipping everything that is already in <asciiDir>/<dataset>.metaInfo
+clusterRun <dataset> algorithm: like run but on cluster.
+concatDownload <dataset>
+concatConvert <dataset>: Concat tab-sep files after last cluster
+    job has finished.
+
+REPOSITORY ADMIN COMMANDS:
+
+addPubmed <dataset>: Extracts PMID from metaInfo file and download
+    title, authors, abstract etc from PubMed. Create .pubmed.metaInfo
+    file based on this and the old metaInfo data.
+remove <dataset>: Remove all files of a given dataset, incl the
+    metaInfoFile and index
+checkMeta <dataSet or metaInfoFile>: Check if all files referenced in metainfo 
+    are present relative to current directory
+repairMeta <dataset>: check headers, column counts, comma-sep data fields and
+    number of lines. Will create a new copy and create a backup of the old
+    metaInfo file.
+copyFiles <dataset> <targetDir>: Copy all files from metaInfo to target
+    directory, (skipping files that are already present)
+info <dataset or metaFilename> <article-ID>: Display information stored about 
+    an article
+uniqueIds <metafilenames>: create a uniqueId table given a list of meta
+    info files and output to stdout
+
+stats <dataset or metaFilename>: Display general statistics obtained from metaInfoFile
+
+supported sources: pmcftp, genetics
+Uses curl or wget and tar, optionally qsub
+
+""")
+
+parser.add_option("-d", "--debug", dest="debug", action="store_true",
+help="show debug messages", default=False) 
+
+parser.add_option("-t", "--testId", dest="testId", action="store",
+help="process only the paper with this ID, write meta to testId.metaInfo") 
+
+parser.add_option("-v", "--verbose", dest="verbose", action="store_true",
+help="display more debug messages", default=False)
+
+parser.add_option("", "--jobCount", dest="nodeCount", action="store",
+type="int", help="only run on every jobCount'th article from metaInfo file."
+"Useful for cluster operation, e.g. run four instances, set jobCount to 4 and"
+"jobId to the instance of the cluster job", default=None) 
+
+parser.add_option("", "--jobId", dest="nodeId", action="store", type="int",
+help="the jobId for cluster operation", default=None) 
+
+parser.add_option("-n", "--dry-run", dest="dryRun", action="store_true",
+help="do not run cluster jobs, just print.  Use this if you need to restart one \
+single job") 
+
+parser.add_option("-c", "--configFile", dest="configFile", action="store",
+help="read this config file, default %default", default="pubtools.conf")
+
+(options, args) = parser.parse_args()
+
+# ----------- MAIN --------------
+if args==[]: 
+    parser.print_help()
+    exit(1)
+
+# argument parsing
+command    = args[0]
+publisher  = args[1]
+parameters = args[2:]
+testId     = options.testId
+nodeId     = options.nodeId
+nodeCount  = options.nodeCount
+dryRun     = options.dryRun
+configFile = options.configFile
+debug      = options.debug
+verbose    = options.verbose
+
+# check options
+assert((nodeId==None and nodeCount==None) or 
+    (nodeId!=None and nodeCount!=None)) # you need to set nodeId/nodeCount together
+
+command = command.lower()
+
+# setup logging and init config file
+if not os.path.isfile(configFile):
+    logging.error("Could not find config file %s, aborting" % configFile)
+    exit(1)
+maxConfig.parse(configFile)
+maxConfig.setSection(PROGNAME)
+logDir      = maxConfig.getSectionPath("logDir", None)
+if logDir==None or not os.path.isdir(logDir):
+    logDir="."
+
+logFileName = os.path.join(logDir, PROGNAME)+".log"
+articleParser.setupLogging(logFileName, options)
+
+downloadDir = maxConfig.mustGet(PROGNAME, "downloadDir")
+asciiDir    = maxConfig.mustGet(PROGNAME, "asciiDir")
+email       = maxConfig.mustGet(PROGNAME, "email")
+
+downloadDir = os.path.join(downloadDir, publisher)
+asciiDir    = os.path.join(asciiDir,    publisher)
+
+metaInfoFile = publisher+".metaInfo"
+
+# remove all files that are part of a dataset
+if command=="remove":
+    indexFn = os.path.join(downloadDir, publisher+".index")
+    metaInfoFn = os.path.join(downloadDir, publisher+".metaInfo")
+
+    answer =raw_input("Sure you want to delete all files associated with the publisher %s? (y/N)" % publisher)
+
+    if answer.lower()=="y":
+        for metaInfo, filename in articleParser.generateFilenames(downloadDir, publisher):
+            filename = os.path.join(downloadDir, filename)
+            logging.debug("Removing file %s" % filename)
+            try:
+                os.remove(filename)
+            except OSError:
+                logging.info("could not delete %s, not found on filesystem" % filename)
+
+        print "Please delete the %s.index and %s.metaInfo files manually" % (publisher, publisher)
+        #os.remove(indexFn)
+        #os.remove(metaInfoFn)
+
+# get index files from publisher
+elif command=="getindex":
+    if not os.path.isdir(downloadDir):
+        logging.info("Creating directory %s" % downloadDir)
+        os.makedirs(downloadDir)
+    indexFile = os.path.join(downloadDir, publisher+".index")
+
+    if publisher=="genetics":
+        articleParser.createIndex_Genetics(indexFile)
+    elif publisher=="elsevier":
+        elsevierDir = maxConfig.mustGet("elsevier", "dataDir")
+        articleParser.createIndex_Elsevier(elsevierDir, indexFile)
+    elif publisher=="pmcftp":
+        localCacheDir = maxConfig.mustGet("pmcftp", "localCacheDir")
+        articleParser.createIndex_Pmc(indexFile, localCacheDir)
+    # dataset is a manually defined subset of Pubmed
+    else:
+        datasetConfig= maxConfig.getAllPrefix(PROGNAME, "dataset")
+        articleParser.getIndex_Dataset(publisher, datasetConfig, downloadDir, PROGNAME, email)
+
+# download files referenced by index file from publisher
+elif command=="download":
+
+    if testId:
+        logging.info("test-mode: writing metainfo to /tmp/metainfo")
+        metaInfoFilename = os.path.join(downloadDir, TESTMETA)
+    else:
+        metaInfoFilename = os.path.join(downloadDir, publisher+".metaInfo")
+
+    # on cluster: write data to node specific file
+    if nodeId!=None: 
+        metaInfoFilename+="."+str(nodeId)
+
+    # write headers 
+    # in cluster or test mode: always overwrite old meta file 
+    if (not os.path.isfile(metaInfoFilename)) or nodeId!=None or testId!=None:
+        writeHeadersToMetaInfo(metaInfoFilename)
+
+    indexFilename = os.path.join(downloadDir, publisher+".index")
+
+    if publisher=="genetics":
+        minNumId = maxConfig.mustGetInt(publisher, "identifierStart")
+        if nodeId!=None:
+            logging.error("This data source does not support downloading on a cluster")
+            sys.exit(1)
+        articleParser.download_Genetics(downloadDir, metaInfoFilename, indexFilename, minNumId, testId)
+
+    elif publisher=="elsevier":
+        minNumId = maxConfig.mustGetInt(publisher, "identifierStart")
+        dataDir          = maxConfig.mustGet("elsevier", "dataDir")
+        ignoreNoFulltext = maxConfig.mustGetBool("elsevier", "ignoreNoFulltext")
+        articleParser.download_Elsevier(downloadDir, indexFilename, metaInfoFilename, nodeCount, nodeId, testId, minNumId, ignoreNoFulltext, dataDir)
+
+    elif publisher=="pmcftp":
+        minNumId       = maxConfig.mustGetInt(publisher, "identifierStart")
+        pmcBaseUrl     = maxConfig.get(publisher, "pmcBaseUrl", None)
+        localCacheDir  = maxConfig.mustGet(publisher, "localCacheDir")
+        tempExtractDir = maxConfig.mustGet(publisher, "tempExtractDir")
+        minNumId       = int(maxConfig.mustGet(publisher, "identifierStart"))
+        doDownload     = maxConfig.mustGetBool(publisher, "doDownload")
+        indexFilename  = os.path.join(downloadDir, publisher+".index")
+
+        if nodeId!=None:
+            tempExtractDir = os.path.join(tempExtractDir,"node"+str(nodeId))
+
+        articleParser.download_Pmc(indexFilename, metaInfoFilename, pmcBaseUrl, tempExtractDir, localCacheDir, downloadDir, minNumId, nodeCount, nodeId, doDownload, testId=testId)
+
+    else: # user-defined datasets
+        datasetConfig    = maxConfig.getAllPrefix(PROGNAME, "dataset")
+        fulltextWriter   = articleParser.FulltextFileWriter(downloadDir, publisher)
+        articleParser.download_Dataset(publisher, datasetConfig, downloadDir, fulltextWriter)
+
+# convert all files in raw/ to ASCII
+elif command=="convert":
+    if not os.path.isdir(asciiDir):
+        logging.info("Creating directory %s" % asciiDir)
+        os.makedirs(asciiDir)
+
+    downloadMetaFilename = os.path.join(downloadDir,publisher+".metaInfo")
+
+    # read ids from new meta file, optionally change to cluster filename
+    asciiMetaFilename = os.path.join(asciiDir,publisher+".metaInfo")
+    if nodeId!=None:
+        asciiMetaFilename+="."+str(nodeId)
+        logging.debug("Cluster mode: zapping old metaInfo file completely")
+        articleParser.writeHeadersToMetaInfo(asciiMetaFilename)
+    if testId!=None:
+        logging.debug("Testing mode, results are written to %s" % TESTMETA)
+        asciiMetaFilename = TESTMETA
+
+    # Do not re-process stuff, read metaInfo file to skip processed files
+    # BUT: read file if not cluster/testMode and file exists
+    if nodeId!=None and testId==None and os.path.isfile(asciiMetaFilename):
+        logging.debug("Reading old ids from %s" % asciiMetaFilename)
+        asciiIdsDone = set(maxTables.TableParser(open(asciiMetaFilename)).column("id"))
+        logging.debug("Found %d already converted ids" % len(asciiIdsDone))
+    else:
+        logging.debug("Not reading already processed IDs, writing headers instead")
+        asciiIdsDone = set()
+        articleParser.writeHeadersToMetaInfo(asciiMetaFilename)
+
+    # parse converter info
+    converterList =  maxConfig.getAllPrefix("convert", "fileType")
+    converters = {}
+    for key, val in converterList:
+        converters[key]=val
+
+
+    if not os.path.isfile(downloadMetaFilename):
+        logging.info("Cannot open metaInfo file %s" % downloadMetaFilename)
+        exit(1)    
+
+    # convert and update metainfo file from raw to ascii
+    for metaInfo in articleParser.readMetaInfos(downloadMetaFilename, nodeCount, nodeId, skipIds=asciiIdsDone):
+        if testId!=None and metaInfo.id!=testId:
+            continue
+        metaInfoDict = metaInfo._asdict()
+        for fieldname, filename in articleParser.metaInfoFilenameGenerator(metaInfo):
+            inFile  = os.path.join(downloadDir, filename)
+            outFile = os.path.join(asciiDir, filename)
+            success = articleParser.toAscii(inFile, outFile, converters, publisher)
+            if not success:
+                metaInfoDict = articleParser.removeMetaInfoFilename(metaInfoDict, fieldname, filename)
+        appendMetaInfo(asciiMetaFilename, metaInfoDict)
+
+# check the .metaInfo file for errors (missing files), or copy all files to another directory
+elif command=="checkmeta" or command=="copyfiles":
+    if command=="checkmeta":
+        checkMeta=True
+    else:
+        checkMeta=False
+
+    if not checkMeta:
+        targetDir = parameters[0]
+        assert(targetDir!="")
+        assert(targetDir!="/")
+
+    metaInfoFilename = publisher
+    if not os.path.isfile(metaInfoFilename):
+        logging.debug("Could not find file %s, searching in %s instead" % (metaInfoFilename, downloadDir))
+        metaInfoFilename = os.path.join(downloadDir, publisher+".metaInfo")
+        baseDir = downloadDir
+    else:
+        baseDir = os.path.dirname(metaInfoFilename)
+        
+
+    logging.info("Checking for duplicate IDs and files that are mentioned in metaInfo but do not exist on file system")
+    tp = maxTables.TableParser(open(metaInfoFilename))
+    dots = maxConfig.getInt(publisher, "progressDots", 1000)
+    i = 0
+    ids = set()
+    for l in tp.lines():
+        if i % dots==0:
+            print i
+        allFiles = []
+
+        if l.id in ids:
+            logging.warn("duplicate ID %s found in metaInfo file " % l.id)
+        ids.add(l.id)
+
+        for col in ['fulltextFileXml', 'fulltextFile', 'fulltextFilePdf', 'suppFiles']:
+            data = l._asdict()[col]
+            if data!="":
+                if "," in data:
+                    files = data.split(",")
+                else:
+                    files = [data]
+                files.extend(files)
+
+        for f in files:
+            fullpath = os.path.join(baseDir, f)
+            if checkMeta: # check mode
+                if not os.path.isfile(fullpath):
+                    logging.warn("file %s does not exist" % fullpath)
+            else: # copy mode
+                targetFilePath = os.path.join(targetDir, f)
+                targetFileDir = os.path.dirname(targetFilePath)
+                try:
+                    os.makedirs(targetFileDir)
+                except OSError, ex:
+                    if ex.errno==17:
+                        pass
+                    else:
+                        raise
+                if os.path.isfile(targetFilePath):
+                    logging.warn("file %s already exists, skipping" % targetFilePath)
+                else:
+                    print "copying", fullpath, targetFilePath
+                    shutil.copy(fullpath, targetFilePath)
+
+        i+=1
+
+# repair column count, truncated lines, missing fields or headers
+elif command=="repairmeta":
+    articleParser.repairMeta(downloadDir, publisher)
+    articleParser.repairMeta(asciiDir, publisher)
+    
+# run textmining algorithm on ASCII files and output to $publisher.$algorithm.tab 
+# (+.$nodeId in cluster mode)
+elif command=="run":
+    if len(parameters)<1:
+        logging.info("Need at least two parameters for command 'run'")
+        logging.info("syntax: pubtools run <dataset> <algorithm>")
+        exit(1)
+    algorithms = parameters[0].split(",")
+    maxConfig.setSection(command)
+
+    for alg in algorithms:
+        # how is the algorithm implemented?
+        algType = maxConfig.mustGet("run", alg+".type")
+        dots    = maxConfig.getInt("run", alg+".progressDots", 1000)
+        # iterate over all text ("all"), only the "best" file per article, 
+        # or best file + suplementary files ("bestSupp")
+        textType = maxConfig.get("run", alg+".textType", "all").lower()
+        # parameters supplied to algorithm wrapper
+        algParameters = dict(maxConfig.getAllPrefix("run",alg+".parameter"))
+
+        # open output file
+        outFilename = maxConfig.get("run", alg+".outfile", alg)
+        outFilename = outFilename + "." + publisher + ".out"
+        outDir = os.path.dirname(outFilename)
+        if outDir!="" and not os.path.isdir(outDir):
+            os.makedirs(outDir)
+            logging.info("Created directory %s" % outDir)
+        if nodeId!=None:
+            outFilename = outFilename+"."+str(nodeId)
+        if not testId:
+            outFile = open(outFilename, "w")
+
+        if algType=="localPipe":
+            program      = maxConfig.mustGet("run", alg+".program")
+            dir          = maxConfig.mustGet("run", alg+".dir")
+            parameters   = maxConfig.mustGet("run", alg+".parameterString")
+            headers      = maxConfig.mustGet("run", alg+".headers")
+
+            commandLine   = program+" "+parameters
+            dir          = os.path.join(pubToolsLibDir, dir)
+            headers      = headers.split(",")
+
+            articleReader = articleParser.FileArticleReader(asciiDir, publisher)
+            articleReader.config(textType, nodeCount, nodeId, testId)
+
+            algRunner     = annotWrappers.PipeRunner(dir, commandLine)
+            annotWrappers.runAlgorithm(articleReader, algRunner, headers, outFile)
+
+        if algType=="java" or algType=="remote":
+            portNo   = int(maxConfig.getSectionValue(alg+".port", "6789"))
+            hostname = maxConfig.getSectionValue(alg+".hostname", "localhost")
+
+            if algType=="java":
+                debugMode   = (debug | verbose)
+                className   = maxConfig.mustGet("run", alg+".className")
+                classParams = maxConfig.getSectionValue(alg+".classParams", None)
+                javaPid = articleParser.startJavaProcess(pubToolsHomeDir, 
+                        className, classParams, debugMode=debugMode)
+
+            # query remote algorithm via tcp
+            try:
+                for metaInfo, lines in articleParser.remoteResultsGenerator(asciiDir, publisher, nodeCount, 
+                        nodeId, textType, testId, hostname, portNo, dots):
+                        if not testId:
+                            for line in lines:
+                                outFile.write(metaInfo.numId+"\t"+line+"\n")
+                        else:
+                            logging.debug("TestId mode set, not writing to file")
+                            print "\n".join(lines)
+
+            except KeyboardInterrupt:
+                if algType=="java":
+                    logging.debug("Trying to kill the java process")
+                    os.kill(javaPid, 7)
+
+            if algType=="java":
+                logging.debug("Trying to kill the java process")
+                os.kill(javaPid, 7)
+
+        if algType=="http":
+            articleReader = articleParser.FileArticleReader(asciiDir, publisher)
+            articleReader.config(textType, nodeCount, nodeId, testId)
+            url       = maxConfig.mustGetSectionValue(alg+".url")
+            fields    = maxConfig.getSectionValue(alg+".fields", None)
+            headers   = maxConfig.mustGetSectionValue(alg+".headers")
+            algRunner = annotWrappers.HttpRunner(url, algParameters, headers, fields = fields)
+
+            annotWrappers.runAlgorithm(articleReader, algRunner, headers, outFile)
+
+        elif algType=="python":
+            # load python module dynamically and get function pointer
+            moduleFilename = os.path.expanduser(maxConfig.mustGet("run", alg+".module"))
+
+            # must add path to system search path first
+            modulePath, moduleName = os.path.split(moduleFilename)
+            moduleName = moduleName.replace(".py","")
+            logging.debug("Loading module %s in dir %s" % (moduleName, modulePath))
+            sys.path.append(modulePath)
+
+            # load algMod as a module, copied from 
+            # http://code.activestate.com/recipes/223972-import-package-modules-at-runtime/
+            try:
+                aMod = sys.modules[moduleName]
+                if not isinstance(aMod, types.ModuleType):
+                    raise KeyError
+            except KeyError:
+                # The last [''] is very important!
+                aMod = __import__(moduleName, globals(), locals(), [''])
+                sys.modules[moduleName] = aMod
+            algFuncName = maxConfig.mustGet("run", alg+".function")
+            algFunc = getattr(aMod, algFuncName)
+        
+            # run python function on all files
+            i=0
+            lastNumId=0
+            lineId=0
+            for metaInfo, isSupp, filename, text in articleParser.generateText(asciiDir, publisher, nodeCount, nodeId, textType, testId=testId):
+                 if i%dots==0:
+                    print i
+                 lines = algFunc(metaInfo, text).split("\n")
+                 # only restart lineId if article changes
+                 if metaInfo.numId!=lastNumId:
+                     lineId = 0
+                 lastNumId=metaInfo.numId
+                 for line in lines:
+                    if testId:
+                        print line
+                    else:
+                        if len(line)>0:
+                            outFile.write(metaInfo.numId+"\t"+str(lineId)+"\t"+filename+"\t"+line+"\n")
+                            lineId+=1
+                 i+=1
+            logging.info("OK, results written to %s" % outFilename)
+
+# export data to mysql database, one record = one textstring
+elif command=="tomysql":
+    sqlConnStr = maxConfig.mustGet("tomysql", "connString")
+    tableName = maxConfig.mustGet("tomysql", "tableName")
+    sqlConn = maxTables.sqlConnection(sqlConnStr)
+    dots = maxConfig.getInt("tomysql", "progressDots", 1000)
+    maxTextSize = maxConfig.getInt("tomysql", "maxTextSize", 16000000)
+    tableName = tableName.replace("$publisher", publisher)
+
+    i=0
+    for metaInfo, isSupp, filename, text in articleParser.generateText(asciiDir, publisher, nodeCount, nodeId, "all"):
+        if i%dots==0:
+            print i, "files processed"
+        if text!="":
+            if len(text)>maxTextSize:
+                logging.debug("record %s: Text size bigger than %d" % (metaInfo.id, maxTextSize))
+                continue
+                
+            txtId = metaInfo.id+"|"+filename
+            text = sqlConn.literal(text)
+            txtId = sqlConn.literal(txtId)
+            sql = "INSERT INTO %s (id_ext, text_body, isSupp) VALUES (%s, %s, %s);" % (tableName, txtId, text, int(isSupp))
+            logging.debug("Executing sql for %s, isSupp is %s" % (filename, isSupp))
+            logging.log(5, "SQL command is %s" % (sql))
+            util.sql(sqlConn, sql)
+            i+=1
+
+elif command=="info":
+    metaFilename = publisher
+    if not os.path.isfile(metaFilename):
+        metaFilename = os.path.join(downloadDir, publisher+".metaInfo")
+    artId  = parameters[0]
+
+    for meta in articleParser.readMetaInfos(metaFilename):
+        if meta.id==artId:
+            mid = meta._asdict()
+            for field in meta._fields:
+                print "%15s: %s" % (field, mid[field])
+
+# print some basic statistics of filenumber, suppl files, extensions, etc 
+# for publisher
+elif command=="stats":
+    metaFilename = publisher
+    if not os.path.isfile(metaFilename):
+        metaFilename = os.path.join(downloadDir, metaFilename+".metaInfo")
+
+    articles = 0
+    fulltextFiles=0
+    pdfFiles = 0
+    xmlFiles = 0
+    asciiFiles = 0
+    suppFiles = 0
+    suppExtCounts = {}
+    artTypeCounts = {}
+
+    count = 0
+    for meta in articleParser.readMetaInfos(metaFilename):
+        articles +=1
+        if meta.fulltextFile!="":
+            fulltextFiles+=1
+        if meta.fulltextFilePdf!="":
+            pdfFiles+=1
+        if meta.fulltextFileXml!="":
+            xmlFiles +=1
+        if meta.suppFiles!="":
+            suppFileList = meta.suppFiles.split(",")
+            suppFiles+= len(suppFileList)
+            suppFileExts = [os.path.splitext(sf)[1].lower() for sf in suppFileList]
+            for ext in suppFileExts:
+                suppExtCounts.setdefault(ext, 0)
+                suppExtCounts[ext]+=1
+        if meta.articleType!="":
+            artTypeCounts.setdefault(meta.articleType, 0)
+            artTypeCounts[meta.articleType]+=1
+
+        if count % 100000 == 0:
+            logging.info("Read %d lines..." % count)
+        count+=1
+
+    data = [ ("Number of articles", articles),
+             ("Number of fulltextFiles (ASCII)", fulltextFiles),
+             ("Number of fulltextFiles (PDF)", pdfFiles),
+             ("Number of fulltextFiles (XML)", xmlFiles), 
+             ("Number of supplemental Files", suppFiles)]
+    print 
+    print "MetaInfo information from file %s:" % metaFilename
+    print
+    for desc, count in data:
+        print "%35s: %d" % (desc, count)
+
+    print "Article count by article type:"
+    lines = []
+    for artType, count in artTypeCounts.iteritems():
+        lines.append( (artType, count) )
+    lines.sort(key=operator.itemgetter(1), reverse=True)
+    for artType, count in lines:
+        print "%35s: %d" % (artType, count)
+
+    print "file extension counts of supplemental data files:"
+    lines = []
+    for ext, count in suppExtCounts.iteritems():
+        lines.append( (ext, count) )
+        lines.sort(key=operator.itemgetter(1), reverse=True)
+    for ext, count in lines:
+        print "%35s: %d" % (ext, count)
+
+# just concat some files, remove header lines
+elif command=="concatdownload" or command=="concatconvert":
+    if command=="concatdownload":
+        baseDir = downloadDir
+    elif command=="concatconvert":
+        baseDir = asciiDir
+
+    outFile = os.path.join(baseDir, publisher+".metaInfo")
+    files = glob.glob(outFile+".*")
+
+    if os.path.isfile(outFile):
+        logging.error("Output file already exists, please remove %s and run %s again" % (outFile, PROGNAME))
+    else:
+        logging.info("Concatenating these files: %s" % ", ".join(files))
+        logging.info("Writing output to: %s" % outFile)
+        logging.info("One dot is 10.000 lines")
+        maxTables.concatHeaderTabFiles(files, outFile, keyColumn=0, progressDots=10000)
+
+# run commands on SGE cluster
+elif command=="clusterdownload" or command=="clusterconvert" or command=="clusterrun":
+    command = command.replace("cluster", "")
+    nodeCount = maxConfig.mustGetInt(PROGNAME, "nodeCount")
+    clusterQueue = maxConfig.mustGet(PROGNAME, "clusterQueue")
+    parameterString = " ".join(parameters)
+
+    logOptions = ""
+    if logDir!=None:
+        logExpr = "%s-$JOB_ID-$JOB_NAME.out" % command
+        logFullPath = os.path.join(logDir,logExpr)
+        logOptions = "-o '"+logFullPath+ "' "
+
+    for nodeId in range(0, nodeCount):
+        jobName = publisher[:4]+command[:4]+str(nodeId)
+        cmdLine = "qsub -q %s -V -j y -b y -cwd -N %s %s '%s %s %s %s --jobCount=%d --jobId=%d '" % (clusterQueue, jobName, logOptions, PROGNAME, command, publisher, parameterString, nodeCount, nodeId)
+        logging.debug("Running: %s" % cmdLine)
+        if not dryRun:
+            ret = os.system(cmdLine)
+        else:
+            ret = 0
+            print cmdLine
+        if ret!=0:
+            logging.error("Error when executing command: %s" % cmdLine)
+
+# Add data from pubmed to metaInfo File
+elif command=="addpubmed":
+    oldMetaFilename = os.path.join(downloadDir, publisher+".metaInfo")
+    newMetaFilename = os.path.join(downloadDir, publisher+".pubmed.metaInfo")
+    logging.info("Reading all PMIDs from %s" % oldMetaFilename)
+
+    oldPmids = set(maxTables.TableParser(open(oldMetaFilename)).column("pmid"))
+    if os.path.isfile(newMetaFilename):
+        newPmids = set(maxTables.TableParser(open(newMetaFilename)).column("pmid"))
+    else:
+        writeHeadersToMetaInfo(newMetaFilename)
+        newPmids = set()
+    toDownloadIds = oldPmids.difference(newPmids)
+
+    oldMetaDicts = {}
+    for metaInfo in maxTables.TableParser(open(oldMetaFilename)).lines():
+        oldMetaDicts[metaInfo.pmid] = metaInfo._asdict()
+    logging.info("Read %d metaInfo entries from %s" % (len(oldMetaDicts), oldMetaFilename))
+
+    for pubmedData in articleParser.ncbiEFetchGenerator(toDownloadIds, tool=PROGNAME, email=email):
+        metaInfoDict = oldMetaDicts[pubmedData["pmid"]]
+        metaInfoDict = mergePubmedIntoMetaInfo(pubmedData, metaInfoDict)
+        logging.log(5, "Writing entry to metaInfo")
+        appendMetaInfo(newMetaFilename, metaInfoDict)
+    #logging.info("Wrote %d lines to %s" % (len(dataDicts), newMetaFilename))
+
+elif command=="uniqueids":
+    filenames = [publisher]
+    if len(parameters)>0:
+        filenames.append(parameters)
+
+    uniqueIds = articleParser.createUniqueIds(filenames)
+    for t in uniqueIds:
+        print "\t".join(t)
+
+else:
+    stderr.write("Error: Illegal command '%s'\n" % command)
+    exit(1)

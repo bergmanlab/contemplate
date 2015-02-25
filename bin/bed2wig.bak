@@ -1,0 +1,114 @@
+#!/usr/bin/python
+
+from bed import *
+import sys
+import copy # for shallow copies
+from optparse import OptionParser
+
+# === COMMAND LINE INTERFACE, OPTIONS AND HELP ===
+parser = OptionParser("usage: %prog [options] args\n - plot the number of bed-features per x-bp window as a wiggle file") 
+
+parser.add_option("-w", "--winsize", dest="winsize", help="size of window [default: %default]", type="int", default="200", metavar="SIZE")
+
+#parser.add_option("-m", "--mindist", dest="distcond", action="append", help="specify minimum distance between all two-tuples of names  names, e.g. A-B:50", type="string", metavar="NUMBER") 
+(options, args) = parser.parse_args()
+
+# ==== FUNCTIONs =====
+class FeatureWindow:
+    """ a windows over features of certain size that keeps track of the of the number of 
+    features of a certain type OR any features (if names==None) """
+    def __init__(self, features, names, winsize):
+        self.features = features
+        self.winFeatures = [] # features currently in the window
+        self.winSize = winsize
+        self.counts = {}
+        self.names = names # these names are tracked
+        self.winStart = features[0].start
+        self.winEnd = self.winStart+self.winSize
+        self.lastPos = features[-1].end
+        self.seqID=features[0].chrom
+        self._fillWindow()
+
+    def __repr__(self):
+        d = []
+        d.append("======WINDOW:========")
+        d.append("start = "+str(self.winStart))
+        d.append("end = "+str(self.winEnd))
+        for k, v in self.counts.iteritems():
+            d.append("occurences of "+k+" = "+repr(v))
+        if self.names!=None:
+            d.append("--NAMES that are tracked:--")
+            for n in self.names:
+                d.append(n)
+        d.append("--FEATURES:--")
+        for f in self.winFeatures:
+            d.append(repr(f))
+        d.append("=====================")
+        return "\n".join(d)
+    
+    def shiftRight(self):
+        """ shift window to the right by one feature and then delete/insert features"""
+        if self.features==[]:
+            raise StopIteration
+        nextF = self.features[0]
+        diff = nextF.start - self.winEnd + 1
+        self.winEnd+=diff
+        self.winStart+=diff
+        # remove on the left side and ajust counts
+        for i in reversed(range(0, len(self.winFeatures))):
+            f = self.winFeatures[i]
+            if f.start<self.winStart and (self.names==None or f.name in self.names):
+                self.counts[f.name]-=1
+                del self.winFeatures[i]
+
+        # add on the right side and ajust counts
+        self._fillWindow()
+
+    def _fillWindow(self):
+        """ takes new features from self.features and put them into the window
+        until no more features are covered by the window """
+        while self.features!=[] and self.features[0].start<self.winEnd:
+            f = self.features.pop(0)
+            if f.start < self.winStart:
+                raise RuntimeError, "The bed file has to be sorted!"
+            if (self.names==None or f.name in self.names ):
+                self.winFeatures.append(f)
+                if not f.name in self.counts.keys():
+                    self.counts[f.name]=0
+                self.counts[f.name]+=1
+
+    def countFeatures(self):
+        return sum(self.counts.values())
+       
+# ==== MAIN ====
+if len(args)==0:
+    sys.stderr.write("\nPlease specify a bed-file. Use '-h' for help. \n")
+    sys.exit(1)
+
+for filename in args:
+    sys.stderr.write("Scanning file %s\n" % filename)
+    lines = open(filename, "r").readlines()
+    fts = parseBedFile(lines)
+    #fw = FeatureWindow(fts, None, options.winsize)
+    chrom = fts[0].chrom
+
+    # prepr dic: pos -> number of features
+    ftdic = {}
+    maxStart = 0
+    minStart = 99999999999999
+    for f in fts:
+        maxStart = max(maxStart, f.start)
+        minStart = min(minStart, f.start)
+        ftdic[f.start]=ftdic.get(f.start,0)+1
+
+    # sum features over range covered by bed
+    print "fixedStep chrom=%s start=%d step=1" % (chrom, minStart)
+    winsize = options.winsize
+    for i in xrange(minStart, maxStart-winsize):
+        num = 0
+        for j in xrange(i, i+winsize):
+            num += ftdic.get(j,0)
+        print "\t".join([chrom, str(i), str(num)])
+
+
+

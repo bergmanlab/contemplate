@@ -1,0 +1,87 @@
+#!/usr/bin/env python
+
+from sys import *
+import sys
+import re
+from optparse import OptionParser
+
+parser = OptionParser("usage: %prog [options] sequence-files\nJoins to tables, can filter as an option, can replace IDs as an option.") 
+
+parser.add_option("-f", "--filter", dest="filter", action="store_true", help="only filter, do not replace the values", metavar="", default="False") 
+parser.add_option("-d", "--delimiter", dest="delim", action="store", help="output field separator,[default: %default]", metavar="", default="\t") 
+parser.add_option("-r", "--removefield", dest="removefield", action="store_true", help="when joining, remove the field which is used to join [default: %default]", metavar="", default="False") 
+
+(options, args) = parser.parse_args()
+
+if len(argv)>1 and argv[1]=="-h" or len(argv)==1:
+  print """ 
+      SYNTAX:
+      lookup <file> <colum to replace> <dict column from> <dict column to>
+  
+    Dictionary file:
+      Will read textlines from stdinput that can be splittet into columns.
+      File will be read as a dictionary into memory: first (from) column is key,
+      second column (from) is the value.
+
+    File parsing from stdin:
+      Every string in the n-th column of stdin-lines is replaced using 
+      this dictionary. if the dictionary does not have a key for it,
+      nothing is printed (this can also be used as a filter). The fields from the dict
+      that are not use for the replacement are added at the end of each line.
+
+      EXAMPLE:
+      cat id2matrix | lookup matrix2accesion
+      cat id2matrix | lookup matrix2accesion 3
+      cat id2matrix | lookup matrix2accesion 4 5 6 
+        == search value of fourth column in id2matrix in fifth column of matrix2accession 
+           and replace with value of sixth column
+  """
+  parser.print_help()
+  exit()
+
+if (len(args)>1):
+    print args[1]
+    replcolumn=int(args[1])-1
+else:
+    replcolumn=-1
+
+if (len(args)>2):
+    fromcolumn=int(args[2])-1
+else:
+    fromcolumn=0
+
+if (len(args)>3):
+    tocolumn=int(args[3])-1
+else:
+    tocolumn=1
+
+print replcolumn, fromcolumn, tocolumn
+
+# read in first file
+f = open(args[0], "r")
+dict={}
+for line in f:
+	fields = line.split()
+        if tocolumn>=len(fields):
+            tocolumn=fromcolumn
+	if not fields==[]:
+            dict[fields[fromcolumn]]=fields[tocolumn:]
+
+delim = options.delim
+lines = sys.stdin.readlines()
+for line in lines:
+	fields = line.split()
+	if fields[replcolumn] in dict:
+                idx = fields[replcolumn]
+                if options.filter==True:
+                    if idx in dict:
+                        print delim.join(fields)
+                else:
+                    hit = dict[idx]
+                    #if len(hit)>tocolumn+1:
+                    #rest = delim.join(dict[idx][1:])
+                    #else:
+                    #rest = ""
+                    print delim.join(fields)+delim+hit[0]
+
+

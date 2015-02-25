@@ -1,0 +1,251 @@
+
+/*
+ * Written by M Haeussler, 2010 for the contemplate package.
+ * You can do whatever you want with this source code
+ * Uses the UCSC Genome Browser library (http://hgdownload.cse.ucsc.edu/admin/jksrc.zip).
+ */
+
+#include "common.h"
+#include "linefile.h"
+#include "localmem.h"
+#include "hash.h"
+#include "options.h"
+#include "dnautil.h"
+#include "rbTree.h"
+#include "chain.h"
+#include "chainNet.h"
+#include "portable.h"
+#include "bed.h"
+#include "twoBit.h"
+#include "fa.h"
+
+
+struct optionSpec optionSpecs[] =
+{
+    {"maxFragSize", OPTION_INT },
+    {"fragmentFile", OPTION_STRING },
+    {"lift", OPTION_STRING },
+    {NULL, 0}
+};
+
+int maxFragSize = 0;	/* maximum size of fasta fragments, 0 to deactivate splitting */
+char *fragmentFilename = 0;	/* filename of bedfile with fragments, 0 to deactivate */
+char *liftSpecFilename = 0;	/* filename of liftUp file, 0 to deactivate*/
+
+void usage()
+/* Explain usage and exit. */
+{
+    errAbort(
+	"chainToFasta - extract fasta sequences for complete chains from 2bit files\n"
+    "               create one fasta file per chain,\n"
+    "               sequences can then be re-aligned with any other software\n"
+	"usage:\n"
+	"   chainToFasta in.chain target.2bit query.2bit outputDir\n"
+	"where:\n"
+	"   in.chain is the chain file \n"
+	"   target.2bit is the target genome 2bit file\n"
+	"   query.2bit is the query genome 2bit file\n"
+    "   outputDir is the output directory for the fasta files\n"
+    "   (one file will be created per chain, filename=chainId)\n"
+
+	"options:\n"
+	"   -maxFragSize=N         - Break fasta files if they are longer than x bp.\n"
+    "                            Will only break at gaps. 0 to deactivate.\n"
+    "                            Default %d.\n"
+	"   -fragmentFile=bedFile  - Write fragments to a bed file for inspection\n"
+	"   -lift=liftUpFile       - Generate a liftUp-file to map fragments back\n"
+    "                            to the genome\n",
+    maxFragSize);
+}
+
+void writeToBed(char* bedFilename, char* chrom, int start, int end)
+{
+    static FILE* bedFile = NULL;
+
+    if (bedFilename==NULL) 
+        return;
+
+    if (bedFile==NULL) 
+        bedFile = mustOpen(bedFilename, "w");
+
+    char* buf = needMem(strlen(chrom) + 1 + 10 + 1 + 10 + 1); 
+    sprintf(buf, "%s\t%d\t%d\n", chrom, start, end);
+    mustWrite(bedFile, buf, strlen(buf));
+    freeMem(buf);
+}
+
+
+char *makeLocString(char* db, char* chrom, int start, int end, char strand)
+/* Make a string of format "dm3-chr1-2000-2100" */
+{
+    char *s2;
+
+	assert(start < 999999999); /* make sure pos is <= 9 digits long (i.e. < 1 gigabase) */
+	assert(end < 999999999);   /* make sure pos is <= 9 digits long (i.e. < 1 gigabase) */
+    s2 = needMem(strlen(db) + 1 + strlen(chrom) + 1 + 9 + 1 + 9 + 1+ 1+ 1); 
+    //sprintf(s2, "%s %s:%d-%d %c", db, chrom, start, end, strand);
+    sprintf(s2, "%s-%s-%d-%d", db, chrom, start, end);
+
+    return s2;
+}
+
+struct chainFragList
+{
+    struct chainFragList *next;
+    int tStart, tEnd, qStart, qEnd;
+};
+
+
+struct chainFragList *splitChain(struct chain* chain, int maxFragSize) 
+/* split chain into pieces of maxFragSize and return as a list of positions */
+{
+    //verbose(1, "chain id %d\n", chain->id);
+    struct cBlock *b;
+    struct cBlock *lastBlock = NULL;
+    struct chainFragList *frag1 = needMem(sizeof(struct chainFragList));
+
+    // create a new fragment
+    struct chainFragList *frag= frag1;
+    frag->tStart=-1;
+
+    for (b = chain->blockList; b != NULL; b = b->next) 
+    {
+        //verbose(1, "%d %d %d %d %d\n", b->tStart, b->tEnd, b->qStart, b->qEnd, b->score);
+        // if there is no data in the current fragment yet: store the first start/end coordinates
+        if (frag->tStart==-1) 
+        {
+            frag->tStart = b->tStart;
+            frag->qStart = b->qStart;
+            frag->tEnd = b->tEnd;
+            frag->qEnd = b->qEnd;
+            continue;
+        }
+
+        if ( (maxFragSize==0) || ( ((b->tEnd - frag->tStart) < maxFragSize) && ( (b->qEnd - frag->qStart) < maxFragSize) ) )
+        {
+            // next fragment is not going to be too long for maxFragSize: just extend current fragment
+            //verbose(1, "target diff %d\n", (b->tEnd - frag->tStart));
+            //verbose(1, "query diff %d\n", (b->qEnd - frag->qStart));
+            frag->tEnd = b->tEnd;
+            frag->qEnd = b->qEnd;
+        } 
+        else 
+        {
+            // next fragment is too long: start a new fragment and fill with defaults
+            struct chainFragList *newfrag = needMem(sizeof(struct chainFragList));
+
+            newfrag->tStart = lastBlock->tStart;
+            newfrag->qStart = lastBlock->qStart;
+            // to create non-overlapping fragments:
+            //newfrag->tStart = b->tStart;
+            //newfrag->qStart = b->qStart;
+            newfrag->tEnd = b->tEnd;
+            newfrag->qEnd = b->qEnd;
+
+            frag->next = newfrag;
+            frag = newfrag;
+        }
+        lastBlock = b;
+
+    }
+    return frag1;
+    
+}
+
+void writeLiftSpec(char* liftSpecFilename, int start, char* idLine, int fragSize, char* name, int chromSize)
+/*  LiftSpec
+ *  is tab-delimited with each line of the form:
+ *     offset oldName oldSize newName newSize
+ *  example lines:
+ *     0       test0   1000    tll_mel 3646
+ *     1000    test1   1000    tll_mel 3646
+ *     2000    test2   1000    tll_mel 3646
+ *     3000    test3   646     tll_mel 3646
+ *
+ */
+{
+    static FILE* liftSpecFile = NULL;
+
+    if (liftSpecFilename==NULL) 
+        return;
+
+    if (liftSpecFile==NULL) 
+        liftSpecFile = mustOpen(liftSpecFilename, "w");
+
+    char* buf = needMem(strlen(idLine) + strlen(name) + (3*9) + 6); 
+    sprintf(buf, "%d\t%s\t%d\t%s\t%d\n", start, idLine, fragSize, name, chromSize);
+    mustWrite(liftSpecFile, buf, strlen(buf));
+    freeMem(buf);
+}
+
+void chainToFasta(char *chainFilename, 
+		     char *t2bitFilename, char *q2bitFilename,
+		     char *outDirname)
+/* chainToFasta - convert chains to one fasta file per chain */
+{
+    struct twoBitFile* t2bit = twoBitOpen(t2bitFilename);
+    char* tDb = basename(t2bitFilename);
+    struct twoBitFile* q2bit = twoBitOpen(q2bitFilename);
+    char* qDb = basename(q2bitFilename);
+
+    struct lineFile *chainFile;
+    struct chain *chain = NULL;
+
+    /* Iterate over chains and extract sequences from 2bitFiles */
+    verbose(1, "Reading, splitting chains from %s, generating fasta files...\n", chainFilename);
+    chainFile = lineFileOpen(chainFilename, TRUE);
+    int fileCount = 0;
+    while ((chain = chainRead(chainFile)) != NULL)
+    {
+        struct chainFragList *chainFragments  = splitChain(chain, maxFragSize);
+        struct chainFragList *chainFrag = chainFragments;
+
+        while (chainFrag) {
+
+            writeToBed(fragmentFilename, chain->tName, chainFrag->tStart, chainFrag->tEnd);
+
+            char outFilename[1024];
+            sprintf(outFilename, "%s/%s-%d.fa", outDirname, chain->tName, chainFrag->tStart);
+
+            FILE *outFile = mustOpen(outFilename, "w");
+            fileCount++;
+
+            char *tIdLine = makeLocString(tDb, chain->tName, chainFrag->tStart, chainFrag->tEnd, '+');
+            char *qIdLine = makeLocString(qDb, chain->qName, chainFrag->qStart, chainFrag->qEnd, chain->qStrand);
+            struct dnaSeq *tSeq = twoBitReadSeqFrag(t2bit, chain->tName, chainFrag->tStart, chainFrag->tEnd);
+            struct dnaSeq *qSeq = twoBitReadSeqFrag(q2bit, chain->qName, chainFrag->qStart, chainFrag->qEnd);
+            faWriteNext(outFile, tIdLine, tSeq->dna, tSeq->size);
+            faWriteNext(outFile, qIdLine, qSeq->dna, qSeq->size);
+
+            int tChromSize = twoBitSeqSize(t2bit, chain->tName);
+            int tFragSize = chainFrag->tEnd - chainFrag->tStart;
+            writeLiftSpec(liftSpecFilename, chainFrag->tStart, tIdLine, tFragSize, chain->tName, tChromSize);
+
+            freeMem(tIdLine);
+            freeMem(qIdLine);
+            carefulClose(&outFile);
+
+            chainFrag = chainFrag->next;
+        }
+
+        slFreeList(&chainFragments);
+    }
+
+    verbose(1, "Done, generated %d fasta files\n", fileCount);
+}
+
+
+int main(int argc, char *argv[])
+/* Process command line. */
+{
+    optionInit(&argc, argv, optionSpecs);
+    if (argc != 5)
+	usage();
+    maxFragSize = optionInt("maxFragSize", maxFragSize);
+    fragmentFilename = optionVal("fragmentFile", NULL);
+    liftSpecFilename = optionVal("lift", NULL);
+    chainToFasta(argv[1], argv[2], argv[3], argv[4]);
+
+    return 0;
+}
+

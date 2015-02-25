@@ -1,0 +1,2 @@
+all:
+	run-patch-mfa	

@@ -1,0 +1,57 @@
+#!/usr/bin/env python
+
+
+from sys import *
+import sys
+import re
+
+def readfasta(lines):
+  ## will read from lines
+  ## will return a list of n seqs
+  ## seq[n][0] is the seqname
+  ## seq[n][1] is the sequence
+  seqs = []
+  for line in lines:
+          line = line.strip()
+	  if line.startswith(">"):
+	    seqs.append([line.strip(">").split()[0], ""])
+          else:
+            if line!="":
+                seqs[-1][1]+=line.replace(" ","").strip()
+  return seqs
+
+def revComp(seq):
+	table = { "a" : "t", "A" : "T", "t" : "a", "T" : "A", "c" : "g", "C":"G", "g":"c", "G":"C", "-":"-" }
+	newseq = ""
+        for nucl in reversed(seq):
+           newseq += table[nucl]
+	return newseq
+
+
+if len(argv)>1:
+  print " Will plot the distribution of nucleotides of many short sequences"
+  print " as a multi-fasta-file."
+  print " The position will be on x-axis, and the number of nucleotides of every type"
+  print " (a,c,t,g,-) on the y-axis."
+  print " Will read file from stdin."
+  print
+  print " syntax: "
+  print " plotfasta "
+  exit() 
+
+lines = sys.stdin.readlines()
+
+seqs = readfasta(lines)
+del lines
+print "pos ncg nat"
+
+for pos in range(0, len(seqs[0][1])):
+	c = {'a':0, 'c':0,'t':0,'g':0,'-':0}
+        #print seqs[0][1][pos],
+        print pos,
+	for seq in seqs:
+		c[seq[1][pos].lower()]+=1
+	#print c['a'],c['c'],c['t'],c['g'],c['-']
+	print c['c']+c['g'], c['a']+c['t']
+	  
+   

@@ -1,0 +1,122 @@
+#!/usr/bin/env python
+
+from sys import *
+from optparse import OptionParser
+import logging
+import tabfile
+import types, glob, os.path
+
+# === COMMAND LINE INTERFACE, OPTIONS AND HELP ===
+parser = OptionParser("usage: %prog [options] queryDb targetDb filenameToFragmentTable seqSizeTable blocksFileOrDir - convert contemplate to psl format") 
+
+#parser.add_option("-l", "--wordlength", dest="motiflength", action="store", help="length of word [default: %default, hexamers]", type="int", metavar="NUMBER", default="6") 
+#parser.add_option("-m", "--maf", dest="maf", action="store_true", help="force maf format [default: %default]", default=True) 
+parser.add_option("-d", "--debug", dest="debug", action="store_true", help="show debug messages") 
+(options, args) = parser.parse_args()
+
+if options.debug:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
+# ==== FUNCTIONs =====
+    
+def readFileToFrag(filename):
+    data = {}
+    f = open(filename)
+    for line in f:
+        key, value = line.split("\t")
+        key = os.path.basename(key)
+        key = os.path.splitext(key)[0]
+        value = value.split(".")[0]
+        data[key]=value
+    return data
+
+def blocksToStartsSizes(blockString, featStart):
+    starts = []
+    sizes = []
+    for blockStartEnd in blockString.split(","):
+        start, end = blockStartEnd.split("-")
+        start, end = int(start), int(end)
+        start = start-1
+        size = end - start
+        starts.append(start)
+        sizes.append(size)
+        
+    blockCount = len(starts)
+    starts = [str(x) for x in starts]
+    sizes  = [str(x) for x in sizes]
+    return ",".join(starts), ",".join(sizes), blockCount
+
+
+# ----------- MAIN --------------
+if args==[]: 
+    parser.print_help()
+    exit(1)
+
+qDb, tDb, seqSizeFilename, blocksFilename = args
+
+fragToSeqSize = tabfile.slurpdict(seqSizeFilename, asInt=True)
+#fileToFrag    = readFileToFrag(filenameToFragFilename)
+
+# input format:
+# 382   444 382 443 382-396,398-444 382-396,397-443
+# out psl
+# 61  1   0   0   0   0   0   0   ++  fragment6469.dm3    8225    381 443 fragment6469.droVir3    15089   381 444 4   15,47   0,15    0,16
+
+# output format bed:
+# fragment6588.dm3  381 444 frag6588.chain0    0   +   381 444 50,50,50    2   15,47   0,16
+
+
+
+if os.path.isdir(blocksFilename):
+    infiles = glob.glob(os.path.join(blocksFilename, "*.blocks"))
+else:
+    infiles = [blocksFilename]
+
+for blocksFilename in infiles:
+    count=0
+    for line in open(blocksFilename):
+        if line.startswith("#"):
+            continue
+        #baseFilename = os.path.splitext(os.path.basename(blocksFilename))[0]
+
+        #fragName = fileToFrag[baseFilename].split(".")[0]
+        line = line.strip()
+        fs = line.split("\t")
+        if len(fs)!=7:
+            logging.info("Incorrect blocks format, file %s" % blocksFilename)
+            break
+        # # ContemplateBlocks - format: source sequence, target start, target end, query start, query end, target blocks, query blocks
+        # fragment8980.dm3        21      48      14      41      21-48   14-41
+        tName, tStart, tEnd, qStart, qEnd, tBlocks, qBlocks = fs
+        fragName = tName.split(".")[0]
+
+        tStart, tEnd, qStart, qEnd = int(tStart), int(tEnd), int(qStart), int(qEnd)
+
+        matches     = min(tEnd-tStart, qEnd-qStart)
+        misMatches  = max(tEnd-tStart, qEnd-qStart) - min(tEnd-tStart, qEnd-qStart)
+        repMatches  = 0
+        nCount      = 0
+        qNumInsert  = 0
+        qBaseInsert = 0
+        tNumInsert  = 0
+        tBaseInsert = 0
+        strand = "+"
+
+        tSize  = fragToSeqSize[tName]
+        tStart = tStart - 1
+
+        qName  = fragName+"."+qDb
+        qSize  = fragToSeqSize[qName]
+        qStart = qStart - 1
+        
+        tStarts, tSizes, tBlockCount = blocksToStartsSizes(tBlocks, tStart)
+        qStarts, qSizes, qBlockCount = blocksToStartsSizes(qBlocks, qStart)
+
+        assert(tBlockCount==qBlockCount)
+        blockCount = tBlockCount
+        qName = qName.replace("ment", "").split(".")[0]+"_chain"+str(count)
+        data = [matches, misMatches, repMatches, nCount, qNumInsert, qBaseInsert, tNumInsert, tBaseInsert, strand, qName, qSize, qStart, qEnd, tName, tSize, tStart, tEnd, blockCount, tSizes, qStarts, tStarts]
+        data = [str(x) for x in data]
+        print "\t".join(data)
+        count+=1

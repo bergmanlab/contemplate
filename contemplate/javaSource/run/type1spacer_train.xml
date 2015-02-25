@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+
+<submodel name="Type1spacer" type="mismatch_type1spacer" no_mixed_stages="1" no_match_only_stages="1" seq0Alfa="DNA" seq1Alfa="DNA">
+  <type1dist self="0.9665692956832197" mismatch="6.491398896462187E-4" insert0="0.016553067185978577" insert1="0.01622849724115547" />
+  <type2dist self="0.9588709677419355" insert0="0.04112903225806452" />
+  <type3dist self="0.9409681227863046" insert1="0.05903187721369539" />
+  <type4dist self="0.3333333333333333" mismatch="0.6666666666666666" />
+  <type5dist mismatch="0.9805825242718446" insert0="0.009708737864077669" insert1="0.009708737864077669" />
+  <emission_dist>
+    <Distribution type="Distribution">
+      <alphabet name="(DNA x DNA)" />
+      <weight sym="(thymine adenine)" prob="0.04808785319909061" />
+      <weight sym="(cytosine adenine)" prob="0.058156057161416044" />
+      <weight sym="(adenine guanine)" prob="0.055233030204611885" />
+      <weight sym="(thymine guanine)" prob="0.05977996102630724" />
+      <weight sym="(guanine thymine)" prob="0.07277119194543683" />
+      <weight sym="(adenine adenine)" prob="0.06335254952906788" />
+      <weight sym="(thymine thymine)" prob="0.07601899967521922" />
+      <weight sym="(cytosine thymine)" prob="0.07212163039948034" />
+      <weight sym="(guanine guanine)" prob="0.09095891523221825" />
+      <weight sym="(cytosine cytosine)" prob="0.06075430334524196" />
+      <weight sym="(guanine adenine)" prob="0.06822426112374147" />
+      <weight sym="(adenine cytosine)" prob="0.04711351088015589" />
+      <weight sym="(cytosine guanine)" prob="0.06919860344267618" />
+      <weight sym="(guanine cytosine)" prob="0.06010474179928548" />
+      <weight sym="(thymine cytosine)" prob="0.054908249431633645" />
+      <weight sym="(adenine thymine)" prob="0.043216141604417016" />
+    </Distribution>
+  </emission_dist>
+  <seq0_dist>
+    <Distribution type="Distribution">
+      <alphabet name="DNA" />
+      <weight sym="cytosine" prob="0.2567966903073286" />
+      <weight sym="guanine" prob="0.2745271867612293" />
+      <weight sym="thymine" prob="0.28871158392434987" />
+      <weight sym="adenine" prob="0.1799645390070922" />
+    </Distribution>
+  </seq0_dist>
+  <seq1_dist>
+    <Distribution type="Distribution">
+      <alphabet name="DNA" />
+      <weight sym="cytosine" prob="0.22457627118644066" />
+      <weight sym="guanine" prob="0.25686037126715094" />
+      <weight sym="thymine" prob="0.2592816787732042" />
+      <weight sym="adenine" prob="0.2592816787732042" />
+    </Distribution>
+  </seq1_dist>
+</submodel>

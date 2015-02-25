@@ -1,0 +1,41 @@
+#!/usr/bin/env python
+
+from sys import *
+from optparse import OptionParser
+import logging
+
+# === COMMAND LINE INTERFACE, OPTIONS AND HELP ===
+parser = OptionParser("usage: %prog [options] filename filename ... - print lines where a value occurs in a certain column for the first time, skip the others, ignoring comments") 
+
+#parser.add_option("-l", "--wordlength", dest="motiflength", action="store", help="length of word [default: %default, hexamers]", type="int", metavar="NUMBER", default="6") 
+#parser.add_option("-m", "--maf", dest="maf", action="store_true", help="force maf format [default: %default]", default=True) 
+parser.add_option("-d", "--debug", dest="debug", action="store_true", help="show debug messages") 
+parser.add_option("-k", "--colIndex", dest="colIndex", action="store", type="int", help="index of column to use, default %default", default=0) 
+(options, args) = parser.parse_args()
+
+if options.debug:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
+# ==== FUNCTIONs =====
+    
+# ----------- MAIN --------------
+if args==[]: 
+    parser.print_help()
+    exit(1)
+
+colIndex = options.colIndex
+
+filenames = args
+values = set()
+for filename in filenames:
+    for line in open(filename):
+        if line.startswith("#"):
+            continue
+        else:
+            value = line.strip("\n").split("\t")[colIndex]
+            if value not in values:
+                values.add(value)
+                print line,
+            else:
+                continue
